@@ -13,7 +13,8 @@ mod errors {
 /// Appchain settlement contract on starknet.
 #[starknet::contract]
 mod appchain {
-    use openzeppelin::access::ownable::{
+    use core::array::ArrayTrait;
+use openzeppelin::access::ownable::{
         OwnableComponent as ownable_cpt, OwnableComponent::InternalTrait as OwnableInternal,
         interface::IOwnable
     };
@@ -30,13 +31,12 @@ mod appchain {
         messaging_cpt, messaging_cpt::InternalTrait as MessagingInternal, IMessaging,
         output_process, output_process::{MessageToStarknet, MessageToAppchain},
     };
-    use piltover::mocks::{
-        IFactRegistryMockDispatcher, IFactRegistryMockDispatcherTrait
-    }; // To change when Herodotus finishes implementing FactRegistry.
-    use piltover::snos_output::ProgramOutput;
+    use piltover::fact_registry::{IFactRegistryDispatcher, IFactRegistryDispatcherTrait};
+    use piltover::snos_output::StarknetOsOutput;
     use piltover::snos_output;
     use piltover::state::component::state_cpt::HasComponent;
     use piltover::state::{state_cpt, state_cpt::InternalTrait as StateInternal, IState};
+    use core::poseidon::{Poseidon, PoseidonImpl, HashStateImpl, poseidon_hash_span};
     use starknet::ContractAddress;
     use super::errors;
 
@@ -70,6 +70,8 @@ mod appchain {
         reentrancy_guard: ReentrancyGuardComponent::Storage,
         #[substorage(v0)]
         state: state_cpt::Storage,
+        fact: felt252,
+        info_length: felt252,
     }
 
     #[event]
@@ -124,20 +126,20 @@ mod appchain {
     impl Appchain of IAppchain<ContractState> {
         fn update_state(
             ref self: ContractState,
-            program_output: Span<felt252>,
+            mut snos_output: Span<felt252>,
+            mut bridge_output: Span<felt252>,
             onchain_data_hash: felt252,
             onchain_data_size: u256
         ) {
+            
             self.reentrancy_guard.start();
             self.config.assert_only_owner_or_operator();
+            let snos_output_hash = poseidon_hash_span(snos_output);
+            let snos_output_hash_in_bridge_output = bridge_output.at(4);
+            assert!(snos_output_hash==*snos_output_hash_in_bridge_output);
+            let output_hash = poseidon_hash_span(bridge_output);
 
-            // Header size + 2 messages segments len.
-            assert(
-                program_output.len() > snos_output::HEADER_SIZE + 2,
-                errors::SNOS_INVALID_PROGRAM_OUTPUT_SIZE
-            );
-
-            let (current_program_hash, current_config_hash): (felt252, felt252) = self
+            let (current_program_hash, _): (felt252, felt252) = self
                 .config
                 .program_info
                 .read();
@@ -146,45 +148,20 @@ mod appchain {
                 onchain_data_hash, onchain_data_size
             };
             let state_transition_fact: u256 = encode_fact_with_onchain_data(
-                program_output, data_availability_fact
+                bridge_output, data_availability_fact
             );
 
-            let mut program_output_mut = program_output;
-            let program_output_struct: ProgramOutput = Serde::deserialize(ref program_output_mut)
-                .unwrap();
-            assert(
-                program_output_struct.config_hash == current_config_hash,
-                errors::SNOS_INVALID_CONFIG_HASH
-            );
-
-            let sharp_fact: u256 = keccak::keccak_u256s_be_inputs(
-                array![current_program_hash.into(), state_transition_fact].span()
-            );
-            assert(
-                IFactRegistryMockDispatcher { contract_address: self.config.get_facts_registry() }
-                    .is_valid(sharp_fact),
-                errors::NO_STATE_TRANSITION_PROOF
-            );
+            let fact = poseidon_hash_span(array![current_program_hash, output_hash].span());
+            self.fact.write(fact);
+            
+            assert!(*IFactRegistryDispatcher { contract_address: self.config.get_facts_registry() }
+            .get_all_verifications_for_fact_hash(fact).at(0).security_bits>50);
 
             self.emit(LogStateTransitionFact { state_transition_fact });
 
             // Perform state update
-            self.state.update(program_output);
+            self.state.update(snos_output);
 
-            let mut offset = snos_output::HEADER_SIZE;
-
-            // TODO(#7): We should update SNOS output to have the messages count
-            // instead of the messages segment len.
-
-            let mut messages_segments = program_output.slice(offset, program_output.len() - offset);
-
-            let (messages_to_starknet, messages_to_appchain) =
-                output_process::gather_messages_from_output(
-                messages_segments
-            );
-
-            self.messaging.process_messages_to_starknet(messages_to_starknet);
-            self.messaging.process_messages_to_appchain(messages_to_appchain);
             self.reentrancy_guard.end();
 
             self
@@ -195,6 +172,13 @@ mod appchain {
                         block_hash: self.state.block_hash.read(),
                     }
                 );
+        }            
+        fn get_fact(self: @ContractState ) -> felt252 {
+            return self.fact.read();
+        }
+        fn get_length(self: @ContractState ) -> felt252 {
+            return self.info_length.read();
         }
     }
+
 }
